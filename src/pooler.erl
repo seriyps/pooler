@@ -252,7 +252,8 @@
         add_member_retry => non_neg_integer(),
         max_lifetime => time_spec(),
         max_lifetime_jitter => time_spec(),
-        num_member_sups => pos_integer()
+        num_member_sups => pos_integer(),
+        member_shutdown => brutal_kill | pos_integer()
     }.
 %% See {@link pooler:new_pool/1}
 

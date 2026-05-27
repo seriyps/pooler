@@ -9,15 +9,20 @@ start_link(#{start_mfa := _} = PoolConf) ->
     start_link(PoolConf, pooler_pool_sup:member_sup_name(PoolConf)).
 
 -spec start_link(pooler:pool_config(), atom()) -> {ok, pid()} | {error, any()}.
-start_link(#{start_mfa := MFA}, SupName) ->
-    supervisor:start_link({local, SupName}, ?MODULE, MFA).
+start_link(#{start_mfa := MFA} = PoolConf, SupName) ->
+    Shutdown = maps:get(member_shutdown, PoolConf, brutal_kill),
+    supervisor:start_link({local, SupName}, ?MODULE, {MFA, Shutdown}).
 
-init({Mod, Fun, Args}) ->
+init({Mod, Fun, Args}) when is_atom(Mod) ->
+    %% Backward compat: old code passed just the MFA as init arg.
+    %% Reached during hot upgrade from a release that predates member_shutdown.
+    init({{Mod, Fun, Args}, brutal_kill});
+init({{Mod, Fun, Args}, Shutdown}) ->
     Worker = #{
         id => Mod,
         start => {Mod, Fun, Args},
         restart => temporary,
-        shutdown => brutal_kill,
+        shutdown => Shutdown,
         type => worker,
         modules => [Mod]
     },

@@ -301,6 +301,41 @@ The callback is called from the helper process instead of
 =supervisor:terminate_child/2=.  For maximum throughput under churn, prefer a
 fast or fire-and-forget teardown so that slots are freed quickly.
 
+**** Graceful member shutdown (member_shutdown)
+
+By default pooler kills member processes with =brutal_kill= (immediate exit,
+no cleanup).  Set =member_shutdown= to a millisecond timeout to allow the
+member's =terminate/2= callback to run before the supervisor considers it done:
+
+#+BEGIN_SRC erlang
+#{name => pg_pool,
+  ...
+  member_shutdown => 5000}   %% wait up to 5 s for clean shutdown
+#+END_SRC
+
+The value maps directly to the [[https://www.erlang.org/doc/apps/stdlib/supervisor.html][OTP supervisor child spec]] =Shutdown= field:
+=brutal_kill= sends =exit(Pid, kill)= (immediate, the default); a
+=pos_integer()= sends =exit(Pid, shutdown)= and waits up to that many
+milliseconds.
+
+Two caveats:
+
+- *Requires the worker to trap exits.* =exit(Pid, shutdown)= kills a process
+  that has not called =process_flag(trap_exit, true)= immediately — including
+  gen_server-based workers, which do /not/ set trap_exit automatically.
+  Workers must explicitly call =process_flag(trap_exit, true)= in their
+  =init/1= for =terminate/2= to run on shutdown.
+
+- *Ignored by custom =stop_mfa= that bypasses the supervisor.* If =stop_mfa=
+  calls the worker directly (e.g. =epgsql:close/1=) rather than going through
+  =supervisor:terminate_child/2=, the =Shutdown= field is never consulted.
+  The default =stop_mfa= uses =supervisor:terminate_child/2= and respects
+  this setting.
+
+Graceful shutdown interacts well with =num_member_sups=: stops across
+different shards proceed in parallel, reducing total teardown time from
+O(N × timeout) to O(N × timeout / num_member_sups).
+
 **** Pools with slow-starting or slow-stopping workers
 
 For pools whose workers take significant time to start (e.g. opening a database
@@ -346,11 +381,15 @@ Defaults to =1= (single supervisor, identical to the legacy layout).
   num_member_sups => 8}    %% 8 parallel member supervisors
 #+END_SRC
 
-When to use it: workloads with non-trivial =start_link= cost where
-=initialize_mfa= is not an option — typically third-party worker libraries that
-only expose a monolithic =start_link/N=. With =initialize_mfa= available, the
-supervisor is held only for the cheap =start_link= portion and a single shard is
-usually sufficient.
+When to use it:
+
+- Workloads with non-trivial =start_mfa= cost where =initialize_mfa= is not
+  an option (e.g. third-party libraries that only expose a monolithic
+  =start_link/N=). With =initialize_mfa= available, the supervisor is held only
+  for the cheap =start_link= portion and a single shard is usually sufficient.
+- Workloads using a graceful =member_shutdown= timeout: with a single
+  supervisor all shutdowns serialise, so total stop time is O(N × timeout);
+  with M shards it becomes O(N × timeout / M).
 
 The cost of extra shards is negligible — each shard is one lightweight
 supervisor process (~2–3 KB). When choosing N, the relevant figure is the
