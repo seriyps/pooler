@@ -61,7 +61,7 @@
     code_change/3
 ]).
 
--vsn(4).
+-vsn(5).
 %% Bump this value and add a new clause to `code_change', if the format of `#pool{}' record changed
 
 %% ------------------------------------------------------------------
@@ -97,6 +97,18 @@
     jitter = {0, sec} :: time_spec(),
     timer = undefined :: reference() | undefined,
     timer_target = undefined :: pid() | undefined
+}).
+
+%% Per-member bookkeeping. Stored as the value of #pool.all_members.
+-record(member, {
+    mref :: reference(),
+    %% `free' when checked into the pool, the consumer's pid when checked out,
+    %% or `{stopping, replace | no_replace}' while async termination is in flight.
+    status :: free | pid() | {stopping, replace | no_replace},
+    %% Timestamp the member entered its current `status' (used by cull/max_age).
+    time :: erlang:timestamp(),
+    %% `erlang:monotonic_time(millisecond)' deadline, or `infinity' when TTL is disabled.
+    expires_at :: integer() | infinity
 }).
 
 -record(pool, {
@@ -255,11 +267,11 @@
 -type member_expiry() :: integer() | infinity.
 %% erlang:monotonic_time(millisecond) deadline, or `infinity' when TTL is disabled.
 -type member_status() :: free | pid() | {stopping, replace | no_replace}.
--type free_member_info() :: {reference(), free, erlang:timestamp(), member_expiry()}.
 -type member_info() :: {reference(), member_status(), erlang:timestamp(), member_expiry()}.
-%% See {@link pool_stats/1}
+%% The 4-tuple shape returned by {@link pool_stats/1} for backward compatibility.
+%% Internally, members are tracked as `#member{}' records.
 
--type members_map() :: #{pid() => member_info()}.
+-type members_map() :: #{pid() => #member{}}.
 -type consumers_map() :: #{pid() => {reference(), [pid()]}}.
 
 -if(?OTP_RELEASE >= 25).
@@ -767,7 +779,12 @@ handle_call({accept_member, StartResult}, _From, Pool) ->
 handle_call(stop, _From, Pool) ->
     {stop, normal, stop_ok, Pool};
 handle_call(pool_stats, _From, Pool) ->
-    {reply, maps:to_list(Pool#pool.all_members), Pool};
+    Stats = maps:fold(
+        fun(Pid, M, Acc) -> [{Pid, member_to_info_tuple(M)} | Acc] end,
+        [],
+        Pool#pool.all_members
+    ),
+    {reply, Stats, Pool};
 handle_call(pool_utilization, _From, Pool) ->
     {reply, compute_utilization(Pool), Pool};
 handle_call(dump_pool, _From, Pool) ->
@@ -805,7 +822,7 @@ handle_info({requestor_timeout, From}, Pool = #pool{queued_requestors = Requesto
 handle_info({'DOWN', MRef, process, Pid, Reason}, State) ->
     State1 =
         case maps:get(Pid, State#pool.all_members, undefined) of
-            {MRef, {stopping, Flag}, _Time, _ExpTs} ->
+            #member{mref = MRef, status = {stopping, Flag}} ->
                 %% Expected death: member was being stopped asynchronously.
                 Pool1 = State#pool{
                     all_members = maps:remove(Pid, State#pool.all_members),
@@ -816,7 +833,7 @@ handle_info({'DOWN', MRef, process, Pid, Reason}, State) ->
                     replace -> add_members_async(1, Pool1);
                     no_replace -> Pool1
                 end;
-            {MRef, _Status, _Time, _ExpTs} ->
+            #member{mref = MRef} ->
                 %% Unexpected death while free or in_use. Process is already
                 %% dead — clean up directly without the async stop path.
                 handle_unexpected_member_down(Pid, State);
@@ -844,7 +861,7 @@ handle_info({ttl_expired, Pid}, #pool{ttl = TTL} = Pool) ->
     Pool1 = Pool#pool{ttl = TTL#ttl{timer = undefined, timer_target = undefined}},
     Pool2 =
         case maps:get(Pid, Pool1#pool.all_members, undefined) of
-            {_, free, _, _} ->
+            #member{status = free} ->
                 remove_pid(Pid, Pool1, replace, max_lifetime);
             _ ->
                 %% In-use, stopping, or already gone — return path handles it
@@ -866,8 +883,11 @@ code_change(_OldVsn, OldState, Extra) when tuple_size(OldState) =:= 24 ->
 code_change(2, OldState, Extra) when tuple_size(OldState) =:= 25 ->
     code_change(3, do_upgrade_to_v3(OldState), Extra);
 %% v3 tuple (27 elements) → v4
-code_change(3, OldState, _Extra) when tuple_size(OldState) =:= 27 ->
-    {ok, do_upgrade_to_v4(OldState)};
+code_change(3, OldState, Extra) when tuple_size(OldState) =:= 27 ->
+    code_change(4, do_upgrade_to_v4(OldState), Extra);
+%% v4 #pool{} (4-tuple all_members entries) → v5 (#member{} record entries)
+code_change(4, OldState, _Extra) when is_record(OldState, pool) ->
+    {ok, do_upgrade_to_v5(OldState)};
 code_change(_, State, _Extra) ->
     {ok, State}.
 
@@ -935,6 +955,18 @@ do_upgrade_to_v4(
         queue_max = QueueMax
     }.
 
+%% Converts v4 all_members entries from 4-tuples to `#member{}' records. The
+%% #pool{} record shape itself is unchanged between v4 and v5.
+do_upgrade_to_v5(#pool{all_members = AllMembers} = Pool) ->
+    Pool#pool{
+        all_members = maps:map(
+            fun(_Pid, {MRef, Status, Ts, ExpTs}) ->
+                #member{mref = MRef, status = Status, time = Ts, expires_at = ExpTs}
+            end,
+            AllMembers
+        )
+    }.
+
 %% ------------------------------------------------------------------
 %% Internal Function Definitions
 %% ------------------------------------------------------------------
@@ -964,7 +996,7 @@ do_accept_member(
         {value, _, StartingMembers1} ->
             MRef = erlang:monitor(process, Pid),
             ExpTs = compute_expiry(Pool1#pool.ttl),
-            Entry = {MRef, free, os:timestamp(), ExpTs},
+            Entry = #member{mref = MRef, status = free, time = os:timestamp(), expires_at = ExpTs},
             AllMembers1 = store_all_members(Pid, Entry, AllMembers),
             pooler_starter:stop(StarterPid),
             Pool2 = Pool1#pool{
@@ -1245,7 +1277,7 @@ do_return_member(
 ) ->
     clean_group_table(Pid, Pool),
     case maps:get(Pid, AllMembers, undefined) of
-        {_, free, _, _} ->
+        #member{status = free} ->
             ?LOG_WARNING(
                 #{
                     label => "ignored return of free member",
@@ -1255,10 +1287,10 @@ do_return_member(
                 #{domain => [pooler]}
             ),
             Pool;
-        {_, {stopping, _}, _, _} ->
+        #member{status = {stopping, _}} ->
             %% member is being stopped asynchronously — ignore this return
             Pool;
-        {MRef, CPid, _FreeTs, ExpTs} ->
+        #member{status = CPid, expires_at = ExpTs} = Member ->
             #pool{
                 free_pids = Free,
                 in_use_count = NumInUse,
@@ -1275,7 +1307,7 @@ do_return_member(
                     Pool2 = Pool1#pool{
                         stopping_count = Pool1#pool.stopping_count + 1,
                         all_members = AllMembers#{
-                            Pid => {MRef, {stopping, replace}, os:timestamp(), ExpTs}
+                            Pid => Member#member{status = {stopping, replace}, time = os:timestamp()}
                         }
                     },
                     pooler_starter_sup:new_stopper(
@@ -1285,7 +1317,7 @@ do_return_member(
                     send_metric(Pool2, stopping_count, Pool2#pool.stopping_count, gauge),
                     Pool2;
                 false ->
-                    Entry = {MRef, free, os:timestamp(), ExpTs},
+                    Entry = Member#member{status = free, time = os:timestamp(), expires_at = ExpTs},
                     Pool2 = Pool1#pool{
                         all_members = store_all_members(Pid, Entry, AllMembers)
                     },
@@ -1305,10 +1337,10 @@ do_return_member(Pid, fail, #pool{all_members = AllMembers} = Pool) ->
     % removed, so use find instead of fetch and ignore missing.
     clean_group_table(Pid, Pool),
     case maps:get(Pid, AllMembers, undefined) of
-        {_MRef, {stopping, _}, _, _} ->
+        #member{status = {stopping, _}} ->
             %% already being stopped asynchronously — ignore
             Pool;
-        {_MRef, _, _, _} ->
+        #member{} ->
             %% replacement is triggered when the member's DOWN arrives
             remove_pid(Pid, Pool, replace, failed);
         undefined ->
@@ -1354,7 +1386,7 @@ handle_unexpected_member_down(Pid, Pool) ->
     clean_group_table(Pid, Pool),
     AllMembers = Pool#pool.all_members,
     case maps:get(Pid, AllMembers, undefined) of
-        {_, free, _, _} ->
+        #member{status = free} ->
             Pool1 = Pool#pool{
                 free_pids = lists:delete(Pid, Pool#pool.free_pids),
                 free_count = Pool#pool.free_count - 1,
@@ -1369,7 +1401,7 @@ handle_unexpected_member_down(Pid, Pool) ->
                         Pool1
                 end,
             add_members_async(1, Pool2);
-        {_, CPid, _, _} ->
+        #member{status = CPid} ->
             Pool1 = Pool#pool{
                 in_use_count = Pool#pool.in_use_count - 1,
                 all_members = maps:remove(Pid, AllMembers),
@@ -1397,12 +1429,12 @@ remove_pid(Pid, Pool, Flag, Reason) ->
         stop_mfa = StopMFA
     } = Pool,
     case maps:get(Pid, AllMembers, undefined) of
-        {MRef, free, Time, ExpTs} ->
+        #member{status = free} = Member ->
             Pool1 = Pool#pool{
                 free_pids = lists:delete(Pid, Pool#pool.free_pids),
                 free_count = Pool#pool.free_count - 1,
                 stopping_count = Pool#pool.stopping_count + 1,
-                all_members = AllMembers#{Pid => {MRef, {stopping, Flag}, Time, ExpTs}}
+                all_members = AllMembers#{Pid => Member#member{status = {stopping, Flag}}}
             },
             pooler_starter_sup:new_stopper(pooler_starter:stop_spec(PoolName, Pid, StopMFA)),
             send_metric(Pool1, killed_free_count, {inc, 1}, counter, #{reason => Reason}),
@@ -1413,11 +1445,11 @@ remove_pid(Pid, Pool, Flag, Reason) ->
                 _ ->
                     Pool1
             end;
-        {MRef, CPid, Time, ExpTs} ->
+        #member{status = CPid} = Member ->
             Pool1 = Pool#pool{
                 in_use_count = Pool#pool.in_use_count - 1,
                 stopping_count = Pool#pool.stopping_count + 1,
-                all_members = AllMembers#{Pid => {MRef, {stopping, Flag}, Time, ExpTs}},
+                all_members = AllMembers#{Pid => Member#member{status = {stopping, Flag}}},
                 consumer_to_pid = cpmap_remove(Pid, CPid, CPMap)
             },
             pooler_starter_sup:new_stopper(pooler_starter:stop_spec(PoolName, Pid, StopMFA)),
@@ -1439,19 +1471,24 @@ remove_pid(Pid, Pool, Flag, Reason) ->
 
 -spec store_all_members(
     pid(),
-    member_info(),
+    #member{},
     members_map()
 ) -> members_map().
-store_all_members(Pid, Val = {_MRef, _CPid, _Time, _ExpTs}, AllMembers) ->
+store_all_members(Pid, #member{} = Val, AllMembers) ->
     AllMembers#{Pid => Val}.
+
+%% @doc Convert a `#member{}' record to the legacy 4-tuple shape exposed via
+%% {@link pool_stats/1}. Kept for API stability with code that pattern-matches
+%% the tuple form.
+-spec member_to_info_tuple(#member{}) -> member_info().
+member_to_info_tuple(#member{mref = MRef, status = Status, time = Time, expires_at = ExpTs}) ->
+    {MRef, Status, Time, ExpTs}.
 
 -spec set_cpid_for_member(pid(), pid(), members_map()) -> members_map().
 set_cpid_for_member(MemberPid, CPid, AllMembers) ->
     maps:update_with(
         MemberPid,
-        fun({MRef, free, Time = {_, _, _}, ExpTs}) ->
-            {MRef, CPid, Time, ExpTs}
-        end,
+        fun(#member{status = free} = M) -> M#member{status = CPid} end,
         AllMembers
     ).
 
@@ -1521,20 +1558,20 @@ schedule_cull(Pool, Delay) ->
     DelayMillis = time_as_millis(Delay),
     erlang:send_after(DelayMillis, Pool, cull_pool).
 
--spec member_info([pid()], members_map()) -> [{pid(), member_info()}].
+-spec member_info([pid()], members_map()) -> [{pid(), #member{}}].
 member_info(Pids, AllMembers) ->
     maps:to_list(maps:with(Pids, AllMembers)).
 
 -spec expired_free_members(
-    Members :: [{pid(), member_info()}],
+    Members :: [{pid(), #member{}}],
     Now :: {_, _, _},
     MaxAge :: time_spec()
-) -> [{pid(), free_member_info()}].
+) -> [{pid(), #member{}}].
 expired_free_members(Members, Now, MaxAge) ->
     MaxMicros = time_as_micros(MaxAge),
     [
         MI
-     || MI = {_, {_, free, LastReturn, _}} <- Members,
+     || MI = {_, #member{status = free, time = LastReturn}} <- Members,
         timer:now_diff(Now, LastReturn) >= MaxMicros
     ].
 
@@ -1933,8 +1970,8 @@ is_member_expired(_Pid, #pool{ttl = undefined}) ->
     false;
 is_member_expired(Pid, #pool{all_members = AllMembers}) ->
     case maps:get(Pid, AllMembers, undefined) of
-        {_, _, _, infinity} -> false;
-        {_, _, _, ExpTs} -> erlang:monotonic_time(millisecond) >= ExpTs;
+        #member{expires_at = infinity} -> false;
+        #member{expires_at = ExpTs} -> erlang:monotonic_time(millisecond) >= ExpTs;
         undefined -> false
     end.
 
@@ -1951,12 +1988,12 @@ remove_free_head(
         stop_mfa = StopMFA
     } = Pool
 ) ->
-    {MRef, free, Time, ExpTs} = maps:get(Pid, AllMembers),
+    #member{status = free} = Member = maps:get(Pid, AllMembers),
     Pool1 = Pool#pool{
         free_pids = Rest,
         free_count = Pool#pool.free_count - 1,
         stopping_count = Pool#pool.stopping_count + 1,
-        all_members = AllMembers#{Pid => {MRef, {stopping, replace}, Time, ExpTs}}
+        all_members = AllMembers#{Pid => Member#member{status = {stopping, replace}}}
     },
     pooler_starter_sup:new_stopper(pooler_starter:stop_spec(PoolName, Pid, StopMFA)),
     send_metric(Pool1, killed_free_count, {inc, 1}, counter, #{reason => max_lifetime}),
@@ -2012,7 +2049,7 @@ maybe_advance_ttl_timer(
         all_members = AllMembers
     } = Pool
 ) ->
-    {_, _, _, TgtExpTs} = maps:get(TgtPid, AllMembers),
+    #member{expires_at = TgtExpTs} = maps:get(TgtPid, AllMembers),
     case NewExpTs < TgtExpTs of
         true -> schedule_ttl_timer_for(Pid, NewExpTs, TTL, Pool);
         false -> Pool
@@ -2052,9 +2089,9 @@ find_earliest_expiry(Pids, AllMembers) ->
     lists:foldl(
         fun(Pid, Acc) ->
             case maps:get(Pid, AllMembers, undefined) of
-                {_, _, _, infinity} ->
+                #member{expires_at = infinity} ->
                     Acc;
-                {_, _, _, ExpTs} ->
+                #member{expires_at = ExpTs} ->
                     case Acc of
                         none -> {Pid, ExpTs};
                         {_, Best} when ExpTs < Best -> {Pid, ExpTs};
@@ -2080,23 +2117,23 @@ ttl_static(#ttl{max_lifetime = ML, jitter = J}) -> {ML, J}.
 %% changed   : shift all existing expiries by the delta; floor at now+(new_lifetime-jitter).
 -spec recompute_member_expiries(members_map(), undefined | #ttl{}, undefined | #ttl{}) -> members_map().
 recompute_member_expiries(AllMembers, _OldTTL, undefined) ->
-    maps:map(fun(_Pid, {MRef, S, Ts, _}) -> {MRef, S, Ts, infinity} end, AllMembers);
+    maps:map(fun(_Pid, #member{} = M) -> M#member{expires_at = infinity} end, AllMembers);
 recompute_member_expiries(AllMembers, undefined, NewTTL) ->
     maps:map(
-        fun(_Pid, {MRef, S, Ts, _}) -> {MRef, S, Ts, compute_expiry(NewTTL)} end,
+        fun(_Pid, #member{} = M) -> M#member{expires_at = compute_expiry(NewTTL)} end,
         AllMembers
     );
 recompute_member_expiries(AllMembers, #ttl{max_lifetime = OldML}, #ttl{max_lifetime = NewML} = NewTTL) ->
     Delta = time_as_millis(NewML) - time_as_millis(OldML),
     Floor = erlang:monotonic_time(millisecond) + time_as_millis(NewML) - time_as_millis(NewTTL#ttl.jitter),
     maps:map(
-        fun(_Pid, {MRef, S, Ts, OldExpTs}) ->
+        fun(_Pid, #member{expires_at = OldExpTs} = M) ->
             NewExpTs =
                 case OldExpTs of
                     infinity -> compute_expiry(NewTTL);
                     _ -> max(OldExpTs + Delta, Floor)
                 end,
-            {MRef, S, Ts, NewExpTs}
+            M#member{expires_at = NewExpTs}
         end,
         AllMembers
     ).
