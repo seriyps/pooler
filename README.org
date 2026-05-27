@@ -254,9 +254,15 @@ a TCP handshake or a database login — still needs to happen before the member
 is safe to use.
 
 The value is an ={M, F, A}= tuple.  Before calling, pooler replaces placeholder
-atoms in =A=: ='$pooler_pid'= with the pid of the newly started member, and
-='$pooler_pool_name'= with the member supervisor name for the pool (same
-placeholders supported by =stop_mfa=):
+atoms in =A= with the corresponding runtime values (same placeholders are
+supported by =stop_mfa=):
+
+- ='$pooler_pid'= — the pid of the newly started member
+- ='$pooler_member_sup'= — the name of the member supervisor that owns this
+  worker (shard-specific when [[#numbermembersups][=num_member_sups > 1=]])
+- ='$pooler_pool'= — the pool name atom
+- ='$pooler_pool_name'= — *deprecated* alias for ='$pooler_member_sup'= kept
+  for backward compatibility; existing configs continue to work unchanged
 
 #+BEGIN_SRC erlang
 #{name => pg_pool,
@@ -314,6 +320,51 @@ or network connection), the recommended configuration pattern is:
 For pools with workers that are slow to stop, use =stop_mfa= with a fast
 asynchronous teardown so that the pool is not blocked while workers drain.
 
+**** Sharded member supervisors (num_member_sups)
+<<numbermembersups>>
+
+This feature mirrors the =num_conns_sups= option introduced in
+[[https://ninenines.eu/articles/ranch-2.0.0/][Ranch 2.0]] to address the same supervisor mailbox bottleneck in
+connection listeners.
+
+By default each pool has a single =simple_one_for_one= supervisor that owns all
+member processes. Concurrent =start_child= / =terminate_child= calls (from
+parallel starters, cull events, and async stoppers) serialize through that
+supervisor's mailbox, so a slow =start_mfa= can stall the pool under load even
+when individual workers are fine.
+
+The =num_member_sups= pool configuration option splits ownership across N
+parallel supervisors. New starts are distributed round-robin and each worker
+remembers which shard owns it, so terminations route to the correct supervisor.
+Defaults to =1= (single supervisor, identical to the legacy layout).
+
+#+BEGIN_SRC erlang
+#{name => pg_pool,
+  init_count => 32,
+  max_count => 128,
+  start_mfa => {my_conn, start_link, []},
+  num_member_sups => 8}    %% 8 parallel member supervisors
+#+END_SRC
+
+When to use it: workloads with non-trivial =start_link= cost where
+=initialize_mfa= is not an option — typically third-party worker libraries that
+only expose a monolithic =start_link/N=. With =initialize_mfa= available, the
+supervisor is held only for the cheap =start_link= portion and a single shard is
+usually sufficient.
+
+The cost of extra shards is negligible — each shard is one lightweight
+supervisor process (~2–3 KB). When choosing N, the relevant figure is the
+expected peak number of *concurrent* starts or stops rather than the total pool
+size. For I/O-bound =start_link= (e.g. opening TCP connections), N can safely
+exceed the CPU scheduler count since blocked processes yield the scheduler.
+=N > max_count= is never useful — at most =max_count= workers can exist at any
+moment, so surplus shards sit permanently empty.
+
+=num_member_sups= can be /increased/ via =pooler:pool_reconfigure/2=; existing
+members stay on their original shards and new starts fill the added shards
+round-robin until churn rebalances things.  /Decreasing/ is not supported and
+returns ={error, num_member_sups_cannot_be_decreased}=.
+
 *** Pool Configuration via =pooler:new_pool=
 You can create pools using =pooler:new_pool/1= when accepts a
 map of pool configuration. Here's an example:
@@ -337,6 +388,8 @@ pooler:pool_reconfigure(rc8081, PoolConfig#{max_count => 10, init_count => 4}).
 It will update the pool's state and will start/stop workers if necessary, join/leave group,
 reschedule the cull timer etc.
 The only parameters that can't be updated are ~name~ and ~start_mfa~.
+~num_member_sups~ can only be increased (not decreased) — see
+[[#numbermembersups][the sharding section]] for details.
 
 However, updated configuration won't survive pool crash (it will be restarted with old config by
 supervisor). But this should not normally happen.
@@ -597,6 +650,11 @@ pooler_NAME_pool as well as a pooler_NAME_member_sup that will be used
 to start and supervise the members of this pool. The
 pooler_starter_sup is used to start temporary workers used for
 managing async member start.
+
+With =num_member_sups > 1= (see [[#numbermembersups][Sharded member supervisors]]), the pool
+supervisor starts N member supervisors. Shard 1 keeps the legacy name
+=pooler_NAME_member_sup= shown above; additional shards are named
+=pooler_NAME_member_sup_2=, =pooler_NAME_member_sup_3=, and so on.
 
 pooler_sup:                one_for_one
 pooler_NAME_pool_sup:      all_for_one

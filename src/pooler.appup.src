@@ -1,4 +1,10 @@
 % -*- mode: erlang -*-
+%% When bumping the version (e.g. 1.7.0 → 1.8.0) and adding a `1\\.7\\.0.*' entry:
+%% remember to include `{update, pooler_pool_sup, supervisor}'. pool_sup's
+%% `init/1' builds child specs dynamically from `num_member_sups', so any change
+%% to that logic (or to the MFA / id / count of the children it returns) requires
+%% the supervisor to re-evaluate `init/1' on hot upgrade — `{load_module, ...}'
+%% alone leaves the running supervisor with stale specs.
 {"1.7.0",
   [{<<"1\\.6\\.0.*">>,
     [{update, pooler, {advanced, []}},

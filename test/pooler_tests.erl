@@ -2209,6 +2209,149 @@ get_n_pids_group(Group, N, Acc) ->
 children_count(SupId) ->
     length(supervisor:which_children(SupId)).
 
+%% ===================================================================
+%% Sharded member supervisor tests (num_member_sups)
+%% ===================================================================
+
+pooler_sharded_member_sups_test_() ->
+    MFA = {pooled_gs, start_link, [{"shard-type"}]},
+    {foreach,
+        fun() ->
+            application:set_env(pooler, pools, []),
+            application:set_env(pooler, metrics_module, pooler_no_metrics),
+            application:start(pooler)
+        end,
+        fun(_) ->
+            application:stop(pooler)
+        end,
+        [
+            {"default num_member_sups=1 uses legacy unsuffixed supervisor name", fun() ->
+                {ok, _} = pooler:new_pool(#{
+                    name => shard_pool_1,
+                    max_count => 4,
+                    init_count => 2,
+                    start_mfa => MFA
+                }),
+                ?assertMatch(P when is_pid(P), whereis(pooler_shard_pool_1_member_sup)),
+                ?assertEqual(undefined, whereis(pooler_shard_pool_1_member_sup_1)),
+                ?assertEqual(1, length(shard_sup_names(shard_pool_1)))
+            end},
+            {"num_member_sups=4 starts 4 supervisors with round-robin worker distribution", fun() ->
+                {ok, _} = pooler:new_pool(#{
+                    name => shard_pool_2,
+                    max_count => 16,
+                    init_count => 8,
+                    num_member_sups => 4,
+                    start_mfa => MFA
+                }),
+                wait_for_dump(shard_pool_2, 5000, fun(#{free_count := C}) -> C =:= 8 end),
+                Sups = shard_sup_names(shard_pool_2),
+                ?assertEqual(4, length(Sups)),
+                [?assertMatch(P when is_pid(P), whereis(S)) || S <- Sups],
+                %% shard 1 always uses the legacy unsuffixed name; _1 suffix must not exist
+                ?assertEqual(undefined, whereis(pooler_shard_pool_2_member_sup_1)),
+                %% 8 workers / 4 shards = 2 per shard (round-robin is exact on init)
+                Counts = [proplists:get_value(active, supervisor:count_children(S), 0) || S <- Sups],
+                ?assertEqual([2, 2, 2, 2], Counts)
+            end},
+            {"fail-returned member is replaced within its own shard", fun() ->
+                {ok, _} = pooler:new_pool(#{
+                    name => shard_pool_3,
+                    max_count => 4,
+                    init_count => 4,
+                    num_member_sups => 4,
+                    start_mfa => MFA
+                }),
+                wait_for_dump(shard_pool_3, 5000, fun(#{free_count := C}) -> C =:= 4 end),
+                Pids = [pooler:take_member(shard_pool_3, 1000) || _ <- lists:seq(1, 4)],
+                [?assert(is_pid(P)) || P <- Pids],
+                [pooler:return_member(shard_pool_3, P, fail) || P <- Pids],
+                %% all 4 replacements must arrive; no orphan workers
+                wait_for_dump(shard_pool_3, 5000, fun(#{free_count := C, stopping_count := S}) ->
+                    C =:= 4 andalso S =:= 0
+                end),
+                ?assertEqual(4, total_shard_workers(shard_pool_3))
+            end},
+            {"cull removes excess workers; supervisor counts match pool state", fun() ->
+                {ok, _} = pooler:new_pool(#{
+                    name => shard_pool_4,
+                    max_count => 8,
+                    init_count => 2,
+                    cull_interval => {500, ms},
+                    max_age => {0, sec},
+                    num_member_sups => 4,
+                    start_mfa => MFA
+                }),
+                %% grow pool past init_count
+                Pids = [pooler:take_member(shard_pool_4, 1000) || _ <- lists:seq(1, 6)],
+                [?assert(is_pid(P)) || P <- Pids],
+                [pooler:return_member(shard_pool_4, P) || P <- Pids],
+                %% trigger cull immediately; skip the racy wait_for_dump(free_count=6)
+                %% — the cull interval may fire before we observe that state
+                shard_pool_4 ! cull_pool,
+                %% wait for all async stops to drain, then verify supervisor
+                %% counts match pool accounting (no orphan workers)
+                #{free_count := FC, in_use_count := IC} =
+                    wait_for_dump(shard_pool_4, 5000, fun(#{stopping_count := S}) -> S =:= 0 end),
+                ?assertEqual(FC + IC, total_shard_workers(shard_pool_4)),
+                ?assertEqual(2, FC + IC)
+            end},
+            {"reconfigure can increase num_member_sups", fun() ->
+                Cfg = #{
+                    name => shard_pool_5,
+                    max_count => 8,
+                    init_count => 4,
+                    num_member_sups => 2,
+                    start_mfa => MFA
+                },
+                {ok, _} = pooler:new_pool(Cfg),
+                wait_for_dump(shard_pool_5, 5000, fun(#{free_count := C}) -> C =:= 4 end),
+                ?assertEqual(2, length(shard_sup_names(shard_pool_5))),
+                {ok, Actions} = pooler:pool_reconfigure(shard_pool_5, Cfg#{num_member_sups => 4}),
+                ?assertMatch([{add_member_sups, 2, 4}], Actions),
+                ?assertEqual(4, length(shard_sup_names(shard_pool_5)))
+            end},
+            {"reconfigure refuses to decrease num_member_sups", fun() ->
+                Cfg = #{
+                    name => shard_pool_6,
+                    max_count => 4,
+                    init_count => 2,
+                    num_member_sups => 4,
+                    start_mfa => MFA
+                },
+                {ok, _} = pooler:new_pool(Cfg),
+                ?assertEqual(
+                    {error, num_member_sups_cannot_be_decreased},
+                    pooler:pool_reconfigure(shard_pool_6, Cfg#{num_member_sups => 2})
+                )
+            end},
+            {"reconfigure with same num_member_sups emits no shard action", fun() ->
+                Cfg = #{
+                    name => shard_pool_7,
+                    max_count => 4,
+                    init_count => 2,
+                    num_member_sups => 2,
+                    start_mfa => MFA
+                },
+                {ok, _} = pooler:new_pool(Cfg),
+                {ok, Actions} = pooler:pool_reconfigure(shard_pool_7, Cfg),
+                ?assertEqual(false, lists:keymember(add_member_sups, 1, Actions)),
+                ?assertEqual(2, length(shard_sup_names(shard_pool_7)))
+            end}
+        ]}.
+
+%% Return the list of member supervisor names for PoolName (all shards).
+shard_sup_names(PoolName) ->
+    #{member_sups := Sups} = dump_pool(PoolName),
+    tuple_to_list(Sups).
+
+%% Sum active worker counts across all shards.
+total_shard_workers(PoolName) ->
+    lists:sum([
+        proplists:get_value(active, supervisor:count_children(S), 0)
+     || S <- shard_sup_names(PoolName)
+    ]).
+
 starting_members(PoolName) ->
     length(maps:get(starting_members, dump_pool(PoolName))).
 

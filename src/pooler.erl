@@ -108,7 +108,11 @@
     %% Timestamp the member entered its current `status' (used by cull/max_age).
     time :: erlang:timestamp(),
     %% `erlang:monotonic_time(millisecond)' deadline, or `infinity' when TTL is disabled.
-    expires_at :: integer() | infinity
+    expires_at :: integer() | infinity,
+    %% 1-based index into `#pool.member_sups' identifying which member supervisor
+    %% owns this worker. Pinned at start time and never changes; used to route
+    %% async terminations to the correct shard.
+    shard_idx = 1 :: pos_integer()
 }).
 
 -record(pool, {
@@ -141,8 +145,16 @@
     %% ExpiresAt per member is stored as the 4th element of all_members tuples.
     ttl = undefined :: undefined | #ttl{},
 
-    %% The supervisor used to start new members
-    member_sup :: atom() | pid(),
+    %% Tuple of `pooler_pooled_worker_sup' names, one per shard. With the default
+    %% `num_member_sups = 1' this is a 1-tuple containing the legacy unsuffixed
+    %% supervisor name (`pooler_<pool>_member_sup'); with N > 1, names are
+    %% `pooler_<pool>_member_sup_1..N'. `tuple_size/1' is the source of truth for
+    %% the shard count. Stored as a tuple (not a list) for O(1) index access via
+    %% `element(ShardIdx, member_sups)' when routing starts and stops to a shard.
+    member_sups :: tuple(),
+    %% Round-robin counter for selecting the next shard to receive a new start.
+    %% 1-based; rotates modulo `tuple_size(member_sups)' after each pick.
+    next_shard = 1 :: pos_integer(),
 
     %% The supervisor used to start starter servers that start
     %% new members. This is what enables async member starts.
@@ -163,11 +175,12 @@
     %% members being consumed.
     consumer_to_pid = #{} :: consumers_map(),
 
-    %% A list of `{References, Timestamp}' tuples representing
-    %% new member start requests that are in-flight. The
-    %% timestamp records when the start request was initiated
-    %% and is used to implement start timeout.
-    starting_members = [] :: [{pid(), erlang:timestamp()}],
+    %% A list of `{StarterPid, Timestamp, ShardIdx}' tuples representing new
+    %% member start requests that are in-flight. The timestamp records when the
+    %% start request was initiated and is used to implement start timeout;
+    %% `ShardIdx' carries the shard the starter was assigned to so it can be
+    %% recorded on the resulting `#member{}' once `accept_member' fires.
+    starting_members = [] :: [{pid(), erlang:timestamp(), pos_integer()}],
     stopping_count = 0 :: non_neg_integer(),
 
     %% The maximum amount of time to allow for member start.
@@ -230,11 +243,16 @@
         metrics_api => folsom | exometer | telemetry,
         metrics_mod => module(),
         stop_mfa => pooler_starter:stop_mfa(),
-        initialize_mfa => {module(), atom(), ['$pooler_pid' | '$pooler_pool_name' | any(), ...]},
+        initialize_mfa =>
+            {module(), atom(), [
+                '$pooler_pid' | '$pooler_member_sup' | '$pooler_pool' | '$pooler_pool_name' | any(),
+                ...
+            ]},
         auto_grow_threshold => non_neg_integer(),
         add_member_retry => non_neg_integer(),
         max_lifetime => time_spec(),
-        max_lifetime_jitter => time_spec()
+        max_lifetime_jitter => time_spec(),
+        num_member_sups => pos_integer()
     }.
 %% See {@link pooler:new_pool/1}
 
@@ -249,6 +267,7 @@
     | {cull, _}
     | {leave_group, group_name()}
     | {join_group, group_name()}
+    | {add_member_sups, pos_integer(), pos_integer()}
     | {set_parameter,
         {group, group_name() | undefined}
         | {init_count, non_neg_integer()}
@@ -260,7 +279,11 @@
         | {metrics_api, folsom | exometer | telemetry}
         | {metrics_mod, module()}
         | {stop_mfa, pooler_starter:stop_mfa()}
-        | {initialize_mfa, undefined | {module(), atom(), ['$pooler_pid' | '$pooler_pool_name' | any(), ...]}}
+        | {initialize_mfa,
+            undefined
+            | {module(), atom(), [
+                '$pooler_pid' | '$pooler_member_sup' | '$pooler_pool' | '$pooler_pool_name' | any(), ...
+            ]}}
         | {auto_grow_threshold, non_neg_integer()}}
     | {update_ttl, undefined | #ttl{}}.
 
@@ -733,6 +756,8 @@ init(#{name := Name, max_count := MaxCount, init_count := InitCount, start_mfa :
             {error, Err} -> exit({error, Err});
             {ok, T} -> T
         end,
+    NumMemberSups = maps:get(num_member_sups, P, 1),
+    MemberSups = pooler_pool_sup:member_sup_names(Name, NumMemberSups),
     Pool = #pool{
         name = Name,
         group = maps:get(group, P, undefined),
@@ -749,14 +774,13 @@ init(#{name := Name, max_count := MaxCount, init_count := InitCount, start_mfa :
         metrics_mod = maps:get(metrics_mod, P, pooler_no_metrics),
         metrics_api = maps:get(metrics_api, P, folsom),
         queue_max = maps:get(queue_max, P, ?DEFAULT_POOLER_QUEUE_MAX),
-        ttl = TTL
+        ttl = TTL,
+        member_sups = MemberSups
     },
-    MemberSup = pooler_pool_sup:build_member_sup_name(Name),
-    Pool1 = set_member_sup(Pool, MemberSup),
     %% This schedules the next cull when the pool is configured for
     %% such and is otherwise a no-op.
-    Pool2 = cull_members_from_pool(Pool1),
-    {ok, NewPool} = init_members_sync(InitCount, Pool2),
+    Pool1 = cull_members_from_pool(Pool),
+    {ok, NewPool} = init_members_sync(InitCount, Pool1),
     {ok, NewPool, {continue, join_group}}.
 
 handle_continue(join_group, #pool{group = undefined} = Pool) ->
@@ -766,9 +790,6 @@ handle_continue(join_group, #pool{group = Group} = Pool) ->
     ok = pg_create(Group),
     ok = pg_join(Group, self()),
     {noreply, Pool}.
-
-set_member_sup(#pool{} = Pool, MemberSup) ->
-    Pool#pool{member_sup = MemberSup}.
 
 handle_call({take_member, Timeout}, From = {APid, _}, #pool{} = Pool) when is_pid(APid) ->
     maybe_reply(take_member_from_pool_queued(Pool, From, Timeout));
@@ -885,8 +906,10 @@ code_change(2, OldState, Extra) when tuple_size(OldState) =:= 25 ->
 %% v3 tuple (27 elements) → v4
 code_change(3, OldState, Extra) when tuple_size(OldState) =:= 27 ->
     code_change(4, do_upgrade_to_v4(OldState), Extra);
-%% v4 #pool{} (4-tuple all_members entries) → v5 (#member{} record entries)
-code_change(4, OldState, _Extra) when is_record(OldState, pool) ->
+%% v4 #pool{} (28-tuple: singular `member_sup', 4-tuple all_members entries,
+%% 2-tuple starting_members) → v5 (`member_sups' tuple + `next_shard',
+%% `#member{}' record entries, 3-tuple starting_members).
+code_change(4, OldState, _Extra) when is_tuple(OldState), tuple_size(OldState) =:= 28, element(1, OldState) =:= pool ->
     {ok, do_upgrade_to_v5(OldState)};
 code_change(_, State, _Extra) ->
     {ok, State}.
@@ -914,14 +937,44 @@ do_upgrade_to_v3(
         MaxAge, CullTimer, MemberSup, StarterSup, AllMembers, ConsumerToPid, StartingMembers, 0, MemberStartTimeout,
         AutoGrowThreshold, StopMFA, undefined, MetricsMod, MetricsAPI, QueuedRequestors, QueueMax}.
 
-%% Converts a v3 27-element pool tuple to a v4 #pool{} record: inserts ttl=undefined
-%% and extends all_members entries from 3-tuples to 4-tuples.
+%% Converts a v3 27-element pool tuple to a v4 28-element pool tuple: inserts
+%% `ttl=undefined' and extends `all_members' entries from 3-tuples to 4-tuples.
+%% Output is positional (matching v4 `#pool{}' shape) so the next step
+%% `do_upgrade_to_v5/1' can destructure it — the current `#pool{}' record def
+%% has moved on to v5 shape and would mis-construct a v4 tuple via record syntax.
 do_upgrade_to_v4(
     {pool, Name, Group, MaxCount, InitCount, StartMFA, FreePids, InUseCount, FreeCount, AddMemberRetry, CullInterval,
         MaxAge, CullTimer, MemberSup, StarterSup, AllMembers, ConsumerToPid, StartingMembers, StoppingCount,
         MemberStartTimeout, AutoGrowThreshold, StopMFA, InitializeMFA, MetricsMod, MetricsAPI, QueuedRequestors,
         QueueMax}
 ) ->
+    NewAllMembers = maps:map(
+        fun(_Pid, {MRef, Status, Ts}) -> {MRef, Status, Ts, infinity} end,
+        AllMembers
+    ),
+    {pool, Name, Group, MaxCount, InitCount, StartMFA, FreePids, InUseCount, FreeCount, AddMemberRetry, CullInterval,
+        MaxAge, CullTimer, undefined, MemberSup, StarterSup, NewAllMembers, ConsumerToPid, StartingMembers,
+        StoppingCount, MemberStartTimeout, AutoGrowThreshold, StopMFA, InitializeMFA, MetricsMod, MetricsAPI,
+        QueuedRequestors, QueueMax}.
+
+%% Converts v4 `#pool{}' (singular `member_sup' field, 4-tuple `all_members'
+%% entries, 2-tuple `starting_members' entries) to v5 (`member_sups' tuple +
+%% `next_shard' counter, `#member{}' records, 3-tuple `starting_members').
+%% The new `#pool{}' record has a different shape so the old state is
+%% destructured positionally.
+do_upgrade_to_v5(
+    {pool, Name, Group, MaxCount, InitCount, StartMFA, FreePids, InUseCount, FreeCount, AddMemberRetry, CullInterval,
+        MaxAge, CullTimer, TTL, MemberSup, StarterSup, AllMembers, ConsumerToPid, StartingMembers, StoppingCount,
+        MemberStartTimeout, AutoGrowThreshold, StopMFA, InitializeMFA, MetricsMod, MetricsAPI, QueuedRequestors,
+        QueueMax}
+) ->
+    NewAllMembers = maps:map(
+        fun(_Pid, {MRef, Status, Ts, ExpTs}) ->
+            #member{mref = MRef, status = Status, time = Ts, expires_at = ExpTs, shard_idx = 1}
+        end,
+        AllMembers
+    ),
+    NewStartingMembers = [{P, T, 1} || {P, T} <- StartingMembers],
     #pool{
         name = Name,
         group = Group,
@@ -935,15 +988,13 @@ do_upgrade_to_v4(
         cull_interval = CullInterval,
         max_age = MaxAge,
         cull_timer = CullTimer,
-        ttl = undefined,
-        member_sup = MemberSup,
+        ttl = TTL,
+        member_sups = {MemberSup},
+        next_shard = 1,
         starter_sup = StarterSup,
-        all_members = maps:map(
-            fun(_Pid, {MRef, Status, Ts}) -> {MRef, Status, Ts, infinity} end,
-            AllMembers
-        ),
+        all_members = NewAllMembers,
         consumer_to_pid = ConsumerToPid,
-        starting_members = StartingMembers,
+        starting_members = NewStartingMembers,
         stopping_count = StoppingCount,
         member_start_timeout = MemberStartTimeout,
         auto_grow_threshold = AutoGrowThreshold,
@@ -953,18 +1004,6 @@ do_upgrade_to_v4(
         metrics_api = MetricsAPI,
         queued_requestors = QueuedRequestors,
         queue_max = QueueMax
-    }.
-
-%% Converts v4 all_members entries from 4-tuples to `#member{}' records. The
-%% #pool{} record shape itself is unchanged between v4 and v5.
-do_upgrade_to_v5(#pool{all_members = AllMembers} = Pool) ->
-    Pool#pool{
-        all_members = maps:map(
-            fun(_Pid, {MRef, Status, Ts, ExpTs}) ->
-                #member{mref = MRef, status = Status, time = Ts, expires_at = ExpTs}
-            end,
-            AllMembers
-        )
     }.
 
 %% ------------------------------------------------------------------
@@ -993,10 +1032,16 @@ do_accept_member(
             %% In this case, we should cleanup.
             pooler_starter:stop_member_async(StarterPid),
             Pool1;
-        {value, _, StartingMembers1} ->
+        {value, {_, _, ShardIdx}, StartingMembers1} ->
             MRef = erlang:monitor(process, Pid),
             ExpTs = compute_expiry(Pool1#pool.ttl),
-            Entry = #member{mref = MRef, status = free, time = os:timestamp(), expires_at = ExpTs},
+            Entry = #member{
+                mref = MRef,
+                status = free,
+                time = os:timestamp(),
+                expires_at = ExpTs,
+                shard_idx = ShardIdx
+            },
             AllMembers1 = store_all_members(Pid, Entry, AllMembers),
             pooler_starter:stop(StarterPid),
             Pool2 = Pool1#pool{
@@ -1099,7 +1144,7 @@ take_member_bookkeeping(
 
 -spec remove_stale_starting_members(
     #pool{},
-    [{pid(), erlang:timestamp()}],
+    [{pid(), erlang:timestamp(), pos_integer()}],
     time_spec()
 ) -> #pool{}.
 remove_stale_starting_members(Pool, StartingMembers, MaxAge) ->
@@ -1114,7 +1159,7 @@ remove_stale_starting_members(Pool, StartingMembers, MaxAge) ->
     ),
     Pool#pool{starting_members = FilteredStartingMembers}.
 
-accumulate_starting_member_not_stale(Pool, Now, SM = {Pid, StartTime}, MaxAgeSecs, AccIn) ->
+accumulate_starting_member_not_stale(Pool, Now, SM = {Pid, StartTime, _ShardIdx}, MaxAgeSecs, AccIn) ->
     case secs_between(StartTime, Now) < MaxAgeSecs of
         true ->
             [SM | AccIn];
@@ -1131,27 +1176,33 @@ accumulate_starting_member_not_stale(Pool, Now, SM = {Pid, StartTime}, MaxAgeSec
             AccIn
     end.
 
-init_members_sync(N, #pool{name = PoolName, member_sup = MemberSup, initialize_mfa = InitMFA} = Pool) ->
+init_members_sync(N, #pool{name = PoolName, initialize_mfa = InitMFA} = Pool) ->
     Self = self(),
     StartTime = os:timestamp(),
-    StartRefs = [
-        {pooler_starter:start_member(PoolName, MemberSup, Self, InitMFA), StartTime}
-     || _I <- lists:seq(1, N)
-    ],
-    Pool1 = Pool#pool{starting_members = StartRefs},
-    case collect_init_members(Pool1) of
+    {StartRefs, Pool1} = lists:foldl(
+        fun(_I, {Acc, P}) ->
+            {ShardIdx, P1} = pick_shard(P),
+            MemberSup = member_sup_for(ShardIdx, P1),
+            StarterPid = pooler_starter:start_member(PoolName, MemberSup, Self, InitMFA),
+            {[{StarterPid, StartTime, ShardIdx} | Acc], P1}
+        end,
+        {[], Pool},
+        lists:seq(1, N)
+    ),
+    Pool2 = Pool1#pool{starting_members = StartRefs},
+    case collect_init_members(Pool2) of
         timeout ->
             ?LOG_ERROR(
                 #{
                     label => "exceeded timeout waiting for members",
                     pool => PoolName,
-                    init_count => Pool1#pool.init_count
+                    init_count => Pool2#pool.init_count
                 },
                 #{domain => [pooler]}
             ),
             error({timeout, "unable to start members"});
-        #pool{} = Pool2 ->
-            {ok, Pool2}
+        #pool{} = Pool3 ->
+            {ok, Pool3}
     end.
 
 collect_init_members(#pool{starting_members = Empty} = Pool) when
@@ -1256,14 +1307,40 @@ take_member_from_pool_queued(
 %% `starting_members'.
 add_members_async(
     Count,
-    #pool{name = PoolName, member_sup = MemberSup, starting_members = StartingMembers, initialize_mfa = InitMFA} = Pool
+    #pool{name = PoolName, starting_members = StartingMembers, initialize_mfa = InitMFA} = Pool
 ) ->
     StartTime = os:timestamp(),
-    StartRefs = [
-        {pooler_starter:start_member(PoolName, MemberSup, InitMFA), StartTime}
-     || _I <- lists:seq(1, Count)
-    ],
-    Pool#pool{starting_members = StartRefs ++ StartingMembers}.
+    {StartRefs, Pool1} = lists:foldl(
+        fun(_I, {Acc, P}) ->
+            {ShardIdx, P1} = pick_shard(P),
+            MemberSup = member_sup_for(ShardIdx, P1),
+            StarterPid = pooler_starter:start_member(PoolName, MemberSup, InitMFA),
+            {[{StarterPid, StartTime, ShardIdx} | Acc], P1}
+        end,
+        {[], Pool},
+        lists:seq(1, Count)
+    ),
+    Pool1#pool{starting_members = StartRefs ++ StartingMembers}.
+
+%% @doc Round-robin shard selection. Returns `{ShardIdx, Pool'}' where the
+%% returned `Pool'' has its `next_shard' counter advanced.
+-spec pick_shard(#pool{}) -> {pos_integer(), #pool{}}.
+pick_shard(#pool{next_shard = I, member_sups = Sups} = Pool) ->
+    N = tuple_size(Sups),
+    NextI =
+        case I >= N of
+            true -> 1;
+            false -> I + 1
+        end,
+    {I, Pool#pool{next_shard = NextI}}.
+
+-spec member_sup_for(pos_integer(), #pool{}) -> atom() | pid().
+member_sup_for(ShardIdx, #pool{member_sups = Sups}) ->
+    element(ShardIdx, Sups).
+
+-spec shard_of(pid(), #pool{}) -> pos_integer().
+shard_of(Pid, #pool{all_members = AllMembers}) ->
+    (maps:get(Pid, AllMembers))#member.shard_idx.
 
 -spec do_return_member(pid(), ok | fail, #pool{}) -> #pool{}.
 do_return_member(
@@ -1311,7 +1388,12 @@ do_return_member(
                         }
                     },
                     pooler_starter_sup:new_stopper(
-                        pooler_starter:stop_spec(PoolName, Pid, Pool2#pool.stop_mfa)
+                        pooler_starter:stop_spec(
+                            PoolName,
+                            member_sup_for(shard_of(Pid, Pool2), Pool2),
+                            Pid,
+                            Pool2#pool.stop_mfa
+                        )
                     ),
                     send_metric(Pool2, killed_in_use_count, {inc, 1}, counter, #{reason => max_lifetime}),
                     send_metric(Pool2, stopping_count, Pool2#pool.stopping_count, gauge),
@@ -1429,14 +1511,16 @@ remove_pid(Pid, Pool, Flag, Reason) ->
         stop_mfa = StopMFA
     } = Pool,
     case maps:get(Pid, AllMembers, undefined) of
-        #member{status = free} = Member ->
+        #member{status = free, shard_idx = ShardIdx} = Member ->
             Pool1 = Pool#pool{
                 free_pids = lists:delete(Pid, Pool#pool.free_pids),
                 free_count = Pool#pool.free_count - 1,
                 stopping_count = Pool#pool.stopping_count + 1,
                 all_members = AllMembers#{Pid => Member#member{status = {stopping, Flag}}}
             },
-            pooler_starter_sup:new_stopper(pooler_starter:stop_spec(PoolName, Pid, StopMFA)),
+            pooler_starter_sup:new_stopper(
+                pooler_starter:stop_spec(PoolName, member_sup_for(ShardIdx, Pool1), Pid, StopMFA)
+            ),
             send_metric(Pool1, killed_free_count, {inc, 1}, counter, #{reason => Reason}),
             send_metric(Pool1, stopping_count, Pool1#pool.stopping_count, gauge),
             case Pool1#pool.ttl of
@@ -1445,14 +1529,16 @@ remove_pid(Pid, Pool, Flag, Reason) ->
                 _ ->
                     Pool1
             end;
-        #member{status = CPid} = Member ->
+        #member{status = CPid, shard_idx = ShardIdx} = Member ->
             Pool1 = Pool#pool{
                 in_use_count = Pool#pool.in_use_count - 1,
                 stopping_count = Pool#pool.stopping_count + 1,
                 all_members = AllMembers#{Pid => Member#member{status = {stopping, Flag}}},
                 consumer_to_pid = cpmap_remove(Pid, CPid, CPMap)
             },
-            pooler_starter_sup:new_stopper(pooler_starter:stop_spec(PoolName, Pid, StopMFA)),
+            pooler_starter_sup:new_stopper(
+                pooler_starter:stop_spec(PoolName, member_sup_for(ShardIdx, Pool1), Pid, StopMFA)
+            ),
             send_metric(Pool1, killed_in_use_count, {inc, 1}, counter, #{reason => Reason}),
             send_metric(Pool1, stopping_count, Pool1#pool.stopping_count, gauge),
             Pool1;
@@ -1593,7 +1679,8 @@ calculate_reconfigure_actions(
         initialize_mfa => undefined,
         metrics_mod => pooler_no_metrics,
         metrics_api => folsom,
-        queue_max => ?DEFAULT_POOLER_QUEUE_MAX
+        queue_max => ?DEFAULT_POOLER_QUEUE_MAX,
+        num_member_sups => 1
     },
     NewWithDefaults0 = maps:merge(Defaults, NewConfig),
     try
@@ -1619,7 +1706,8 @@ calculate_reconfigure_actions(
                 stop_mfa,
                 initialize_mfa,
                 auto_grow_threshold,
-                ttl
+                ttl,
+                num_member_sups
             ]
         )
     of
@@ -1726,6 +1814,13 @@ mk_rec_action(ttl, NewTTL, _Config, #pool{ttl = OldTTL}) ->
         {Same, Same} -> [];
         _ -> [{update_ttl, NewTTL}]
     end;
+mk_rec_action(num_member_sups, New, _, #pool{member_sups = Sups}) ->
+    OldN = tuple_size(Sups),
+    if
+        New > OldN -> [{add_member_sups, OldN, New}];
+        New < OldN -> throw({error, num_member_sups_cannot_be_decreased});
+        true -> []
+    end;
 mk_rec_action(_Param, _NewVal, _, _Pool) ->
     %% not changed
     [].
@@ -1756,6 +1851,13 @@ apply_reconfigure_action({join_group, Group}, Pool) ->
 apply_reconfigure_action({leave_group, Group}, Pool) ->
     ok = pg_leave(Group, self()),
     Pool;
+apply_reconfigure_action(
+    {add_member_sups, OldN, NewN},
+    #pool{name = PoolName, start_mfa = StartMFA, member_sups = OldSups} = Pool
+) ->
+    NewNames = pooler_pool_sup:add_member_sups(PoolName, StartMFA, OldN, NewN),
+    NewSups = list_to_tuple(tuple_to_list(OldSups) ++ NewNames),
+    Pool#pool{member_sups = NewSups};
 apply_reconfigure_action({update_ttl, NewTTL}, Pool) ->
     case Pool#pool.ttl of
         #ttl{timer = TRef} when is_reference(TRef) -> erlang:cancel_timer(TRef);
@@ -1988,14 +2090,16 @@ remove_free_head(
         stop_mfa = StopMFA
     } = Pool
 ) ->
-    #member{status = free} = Member = maps:get(Pid, AllMembers),
+    #member{status = free, shard_idx = ShardIdx} = Member = maps:get(Pid, AllMembers),
     Pool1 = Pool#pool{
         free_pids = Rest,
         free_count = Pool#pool.free_count - 1,
         stopping_count = Pool#pool.stopping_count + 1,
         all_members = AllMembers#{Pid => Member#member{status = {stopping, replace}}}
     },
-    pooler_starter_sup:new_stopper(pooler_starter:stop_spec(PoolName, Pid, StopMFA)),
+    pooler_starter_sup:new_stopper(
+        pooler_starter:stop_spec(PoolName, member_sup_for(ShardIdx, Pool1), Pid, StopMFA)
+    ),
     send_metric(Pool1, killed_free_count, {inc, 1}, counter, #{reason => max_lifetime}),
     send_metric(Pool1, stopping_count, Pool1#pool.stopping_count, gauge),
     case TTL#ttl.timer_target of
