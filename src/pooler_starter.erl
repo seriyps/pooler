@@ -7,9 +7,16 @@
 
 -include_lib("kernel/include/logger.hrl").
 
+%% Legacy placeholder: misnomer — resolves to the (shard-specific) member sup name,
+%% not the pool name. Kept as a deprecated alias for ?POOLER_MEMBER_SUP for backward
+%% compatibility with existing user-provided stop_mfa configurations.
 -define(POOLER_POOL_NAME, '$pooler_pool_name').
+%% Shard-specific member supervisor name. Use this in new stop_mfa configurations.
+-define(POOLER_MEMBER_SUP, '$pooler_member_sup').
+%% The pool name atom. Use this when stop_mfa needs to look up pool state.
+-define(POOLER_POOL, '$pooler_pool').
 -define(POOLER_PID, '$pooler_pid').
--define(DEFAULT_STOP_MFA, {supervisor, terminate_child, [?POOLER_POOL_NAME, ?POOLER_PID]}).
+-define(DEFAULT_STOP_MFA, {supervisor, terminate_child, [?POOLER_MEMBER_SUP, ?POOLER_PID]}).
 
 %% ------------------------------------------------------------------
 %% API Function Exports
@@ -22,9 +29,9 @@
     start_member/4,
     stop_member_async/1,
     stop/1,
-    stop_spec/3,
+    stop_spec/4,
     default_stop_mfa/0,
-    replace_placeholders/3
+    replace_placeholders/4
 ]).
 
 %% ------------------------------------------------------------------
@@ -46,20 +53,20 @@
 -type pool_member_sup() :: pid() | atom().
 -type parent() :: pid() | pool.
 -type initialize_mfa() :: undefined | {module(), atom(), [term()]}.
--type stop_mfa() :: {module(), atom(), ['$pooler_pid' | '$pooler_pool_name' | term()]}.
+-type stop_mfa() ::
+    {module(), atom(), ['$pooler_pid' | '$pooler_member_sup' | '$pooler_pool' | '$pooler_pool_name' | term()]}.
 -type start_result() :: {StarterPid :: pid(), Result :: pid() | {error, _}}.
--opaque start_spec() :: {pooler:pool_name(), pool_member_sup(), parent(), initialize_mfa()}.
-%% {PoolName, MemberPid, StopMFA}
--opaque stop_spec() :: {pooler:pool_name(), pid(), stop_mfa()}.
+-opaque start_spec() :: {starter_spec, pooler:pool_name(), pool_member_sup(), parent(), initialize_mfa()}.
+-opaque stop_spec() :: {stopper_spec, pooler:pool_name(), pool_member_sup(), pid(), stop_mfa()}.
 
 %% ------------------------------------------------------------------
 %% API Function Definitions
 %% ------------------------------------------------------------------
 
 -spec start_link(start_spec() | stop_spec()) -> {ok, pid()}.
-start_link({_, _, _} = Spec) ->
+start_link({starter_spec, _, _, _, _} = Spec) ->
     gen_server:start_link(?MODULE, Spec, []);
-start_link({_, _, _, _} = Spec) ->
+start_link({stopper_spec, _, _, _, _} = Spec) ->
     gen_server:start_link(?MODULE, Spec, []).
 
 stop(Starter) ->
@@ -81,7 +88,7 @@ start_member(PoolName, PoolMemberSup) ->
 
 -spec start_member(pooler:pool_name(), pool_member_sup(), initialize_mfa()) -> pid().
 start_member(PoolName, PoolMemberSup, InitMFA) ->
-    {ok, Pid} = pooler_starter_sup:new_starter({PoolName, PoolMemberSup, pool, InitMFA}),
+    {ok, Pid} = pooler_starter_sup:new_starter({starter_spec, PoolName, PoolMemberSup, pool, InitMFA}),
     Pid.
 
 %% @doc Same as {@link start_member/2} except that instead of calling
@@ -94,7 +101,7 @@ start_member(PoolName, PoolMemberSup, InitMFA) ->
 %% initial set of pool members in parallel.
 -spec start_member(pooler:pool_name(), pool_member_sup(), pid(), initialize_mfa()) -> pid().
 start_member(PoolName, PoolMemberSup, Parent, InitMFA) ->
-    {ok, Pid} = pooler_starter_sup:new_starter({PoolName, PoolMemberSup, Parent, InitMFA}),
+    {ok, Pid} = pooler_starter_sup:new_starter({starter_spec, PoolName, PoolMemberSup, Parent, InitMFA}),
     Pid.
 
 %% @doc Stop a member in the pool
@@ -123,15 +130,16 @@ stop_member_async(Pid) ->
 }).
 
 -spec init(start_spec() | stop_spec()) -> {ok, #starter{}, {continue, start | stop}}.
-init({PoolName, MemberPid, StopMFA}) ->
+init({stopper_spec, PoolName, MemberSup, MemberPid, StopMFA}) ->
     {ok,
         #starter{
             pool_name = PoolName,
+            pool_member_sup = MemberSup,
             stopping_pid = MemberPid,
             stopping_mfa = StopMFA
         },
         {continue, stop}};
-init({PoolName, PoolMemberSup, Parent, InitMFA}) ->
+init({starter_spec, PoolName, PoolMemberSup, Parent, InitMFA}) ->
     {ok, #starter{pool_name = PoolName, pool_member_sup = PoolMemberSup, parent = Parent, initialize_mfa = InitMFA},
         {continue, start}}.
 
@@ -145,9 +153,10 @@ handle_continue(
     {noreply, State#starter{msg = Msg}};
 handle_continue(
     stop,
-    #starter{pool_name = PoolName, stopping_pid = MemberPid, stopping_mfa = StopMFA} = State
+    #starter{pool_name = PoolName, pool_member_sup = MemberSup, stopping_pid = MemberPid, stopping_mfa = StopMFA} =
+        State
 ) ->
-    terminate_pid(PoolName, MemberPid, StopMFA),
+    terminate_pid(PoolName, MemberSup, MemberPid, StopMFA),
     {stop, normal, State}.
 
 handle_call(_Request, _From, State) ->
@@ -186,7 +195,7 @@ code_change(_OldVsn, State, _Extra) ->
 do_start_member(PoolSup, PoolName, InitMFA) ->
     case supervisor:start_child(PoolSup, []) of
         {ok, Pid} ->
-            case call_initialize_mfa(PoolName, Pid, InitMFA) of
+            case call_initialize_mfa(PoolName, PoolSup, Pid, InitMFA) of
                 ok ->
                     {self(), Pid};
                 Error ->
@@ -218,38 +227,43 @@ do_start_member(PoolSup, PoolName, InitMFA) ->
 default_stop_mfa() ->
     ?DEFAULT_STOP_MFA.
 
--spec stop_spec(pooler:pool_name(), pid(), stop_mfa()) -> stop_spec().
-stop_spec(PoolName, MemberPid, StopMFA) ->
-    {PoolName, MemberPid, StopMFA}.
+-spec stop_spec(pooler:pool_name(), pool_member_sup(), pid(), stop_mfa()) -> stop_spec().
+stop_spec(PoolName, MemberSup, MemberPid, StopMFA) ->
+    {stopper_spec, PoolName, MemberSup, MemberPid, StopMFA}.
 
 %% @doc Best-effort termination for a pool member: applies the given MFA with
-%% `?POOLER_PID' and `?POOLER_POOL_NAME' placeholders replaced by the actual
-%% pid and pool name. Falls back to the default stop MFA on any failure.
--spec terminate_pid(pooler:pool_name(), pid(), stop_mfa()) -> ok.
-terminate_pid(PoolName, Pid, {Mod, Fun, Args}) when is_list(Args) ->
-    NewArgs = replace_placeholders(PoolName, Pid, Args),
+%% `?POOLER_PID', `?POOLER_MEMBER_SUP', `?POOLER_POOL', and (legacy)
+%% `?POOLER_POOL_NAME' placeholders replaced by the actual values. Falls back
+%% to the default stop MFA on any failure.
+-spec terminate_pid(pooler:pool_name(), pool_member_sup(), pid(), stop_mfa()) -> ok.
+terminate_pid(PoolName, MemberSup, Pid, {Mod, Fun, Args}) when is_list(Args) ->
+    NewArgs = replace_placeholders(PoolName, MemberSup, Pid, Args),
     try erlang:apply(Mod, Fun, NewArgs) of
         _ -> ok
     catch
-        _:_ -> terminate_pid(PoolName, Pid, ?DEFAULT_STOP_MFA)
+        _:_ -> terminate_pid(PoolName, MemberSup, Pid, ?DEFAULT_STOP_MFA)
     end.
 
--spec replace_placeholders(pooler:pool_name(), pid(), [term()]) -> [term()].
-replace_placeholders(PoolName, Pid, Args) ->
+-spec replace_placeholders(pooler:pool_name(), pool_member_sup(), pid(), [term()]) -> [term()].
+replace_placeholders(PoolName, MemberSup, Pid, Args) ->
     [
         case Arg of
-            ?POOLER_POOL_NAME -> pooler_pool_sup:build_member_sup_name(PoolName);
+            ?POOLER_MEMBER_SUP -> MemberSup;
+            %% Legacy alias — semantically same as ?POOLER_MEMBER_SUP. The original
+            %% name was a misnomer (it never resolved to the pool name).
+            ?POOLER_POOL_NAME -> MemberSup;
+            ?POOLER_POOL -> PoolName;
             ?POOLER_PID -> Pid;
             _ -> Arg
         end
      || Arg <- Args
     ].
 
--spec call_initialize_mfa(pooler:pool_name(), pid(), initialize_mfa()) -> ok | {error, term()}.
-call_initialize_mfa(_PoolName, _Pid, undefined) ->
+-spec call_initialize_mfa(pooler:pool_name(), pool_member_sup(), pid(), initialize_mfa()) -> ok | {error, term()}.
+call_initialize_mfa(_PoolName, _MemberSup, _Pid, undefined) ->
     ok;
-call_initialize_mfa(PoolName, Pid, {Mod, Fun, Args}) ->
-    NewArgs = replace_placeholders(PoolName, Pid, Args),
+call_initialize_mfa(PoolName, MemberSup, Pid, {Mod, Fun, Args}) ->
+    NewArgs = replace_placeholders(PoolName, MemberSup, Pid, Args),
     try erlang:apply(Mod, Fun, NewArgs) of
         ok -> ok;
         {error, _} = Err -> Err;

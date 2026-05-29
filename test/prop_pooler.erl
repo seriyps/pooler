@@ -7,7 +7,8 @@
     prop_fixed_take_return/1,
     prop_fixed_take_return_broken/1,
     prop_fixed_client_died/1,
-    prop_group_take_return/1
+    prop_group_take_return/1,
+    prop_sharded_worker_count_invariant/1
 ]).
 
 -include_lib("proper/include/proper.hrl").
@@ -427,10 +428,50 @@ assert_worker_count_bounded(PoolNameOrPid, MaxCount) ->
                 {registered_name, N} = erlang:process_info(PoolNameOrPid, registered_name),
                 N
         end,
-    MemberSup = pooler_pool_sup:build_member_sup_name(PoolName),
-    Counts = supervisor:count_children(MemberSup),
-    Active = proplists:get_value(active, Counts, 0),
+    Active = total_shard_workers(PoolName),
     ?assert(Active =< MaxCount).
+
+prop_sharded_worker_count_invariant(doc) ->
+    "For any take/return sequence on a sharded pool, the total active supervisor "
+    "worker count across all shards always equals the number of tracked members.".
+
+prop_sharded_worker_count_invariant() ->
+    ?FORALL(
+        {Size, NumShards},
+        {range(1, 8), range(1, 4)},
+        with_pool(
+            #{
+                name => ?FUNCTION_NAME,
+                init_count => Size * NumShards,
+                max_count => Size * NumShards,
+                num_member_sups => NumShards,
+                start_mfa => {pooled_gs, start_link, [{?FUNCTION_NAME}]}
+            },
+            fun() ->
+                Pool = ?FUNCTION_NAME,
+                Total = Size * NumShards,
+                pool_is_free(Pool, Total),
+                assert_shard_count_eq(Pool, Total),
+                Pids = [pooler:take_member(Pool) || _ <- lists:seq(1, Total)],
+                assert_shard_count_eq(Pool, Total),
+                [pooler:return_member(Pool, P) || P <- Pids],
+                assert_shard_count_eq(Pool, Total),
+                true
+            end
+        )
+    ).
+
+%% Sum active worker counts across all shards of PoolName.
+total_shard_workers(PoolName) ->
+    #{member_sups := Sups} = gen_server:call(PoolName, dump_pool),
+    lists:sum([
+        proplists:get_value(active, supervisor:count_children(S), 0)
+     || S <- tuple_to_list(Sups)
+    ]).
+
+assert_shard_count_eq(PoolName, Expected) ->
+    Active = total_shard_workers(PoolName),
+    ?assertEqual(Expected, Active).
 
 pg_start() ->
     pg:start(pg).
